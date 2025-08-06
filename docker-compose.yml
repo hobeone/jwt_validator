@@ -1,0 +1,18 @@
+services:
+  # The Go microservice for validating JWTs
+  jwt_validator:
+    container_name: jwt_validator_service
+    # This tells Docker Compose to build the image from the Dockerfile
+    # in the current directory.
+    build:
+      context: .
+      dockerfile: Dockerfile
+    environment:
+      # --- IMPORTANT: SET THESE VARIABLES ---
+      # Your Cloudflare Access team name (e.g., 'my-team' from my-team.cloudflareaccess.com)
+      - CF_TEAM_DOMAIN
+      # The Application Audience (AUD) Tag from your Cloudflare Access Application
+      - CF_AUDIENCE_TAG
+    restart: unless-stopped
+    ports:
+      - 9001:9001
