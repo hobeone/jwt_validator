@@ -2,6 +2,7 @@
 package main
 
 import (
+	"context"
 	"crypto/rand"
 	"crypto/rsa"
 	"encoding/json"
@@ -79,6 +80,7 @@ func TestValidationHandler(t *testing.T) {
 	testConfig := &Config{
 		TeamDomain:  "test-team",
 		AudienceTag: "test-aud-tag",
+		ListenAddress: ":9001",
 	}
 
 	// We override the fetchURL to point to our mock server
@@ -220,4 +222,73 @@ type nullWriter struct{}
 
 func (w *nullWriter) Write(p []byte) (n int, err error) {
 	return len(p), nil
+}
+
+func TestFetchKeysCache(t *testing.T) {
+	// 1. Setup: Generate keys and a mock JWKS endpoint
+	_, publicKey, err := generateTestKeys()
+	if err != nil {
+		t.Fatalf("Failed to generate test keys: %v", err)
+	}
+
+	// Create a mock server to act as the Cloudflare JWKS endpoint
+	var fetchCount int
+	mockJwksServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fetchCount++
+		keySet := jwk.NewSet()
+		keySet.Add(publicKey)
+
+		w.Header().Set("Content-Type", "application/json")
+		if err := json.NewEncoder(w).Encode(keySet); err != nil {
+			t.Fatalf("Failed to encode mock JWKS response: %v", err)
+		}
+	}))
+	defer mockJwksServer.Close()
+
+	// 2. Setup: Create the application instance for testing
+	testConfig := &Config{
+		TeamDomain: "test-team",
+	}
+
+	// We override the fetchURL to point to our mock server
+	testKeySet := newKeySet(testConfig.TeamDomain)
+	testKeySet.fetchURL = mockJwksServer.URL
+	testKeySet.maxAge = 1 * time.Hour // Set a long cache duration for the first part of the test
+
+	// 3. First fetch - should fetch from the server
+	_, err = testKeySet.fetchKeys(context.Background())
+	if err != nil {
+		t.Fatalf("First fetch failed: %v", err)
+	}
+	if fetchCount != 1 {
+		t.Errorf("Expected 1 fetch, got %d", fetchCount)
+	}
+	firstFetchTime := testKeySet.lastFetch
+
+	// 4. Second fetch - should use the cache
+	_, err = testKeySet.fetchKeys(context.Background())
+	if err != nil {
+		t.Fatalf("Second fetch failed: %v", err)
+	}
+	if fetchCount != 1 {
+		t.Errorf("Expected 1 fetch after cached call, got %d", fetchCount)
+	}
+	if !testKeySet.lastFetch.Equal(firstFetchTime) {
+		t.Errorf("Expected lastFetch time to be unchanged, but it was updated")
+	}
+
+	// 5. Expire the cache and fetch again
+	testKeySet.maxAge = 1 * time.Nanosecond // Expire the cache
+	time.Sleep(2 * time.Nanosecond)
+
+	_, err = testKeySet.fetchKeys(context.Background())
+	if err != nil {
+		t.Fatalf("Third fetch failed: %v", err)
+	}
+	if fetchCount != 2 {
+		t.Errorf("Expected 2 fetches after cache expiration, got %d", fetchCount)
+	}
+	if testKeySet.lastFetch.Equal(firstFetchTime) {
+		t.Errorf("Expected lastFetch time to be updated, but it was unchanged")
+	}
 }

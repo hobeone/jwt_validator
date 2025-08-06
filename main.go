@@ -4,21 +4,22 @@ package main
 import (
 	"context"
 	"fmt"
-	"log"
+	"log/slog"
 	"net/http"
 	"os"
 	"time"
 
 	jwt "github.com/golang-jwt/jwt/v4"
+	"github.com/kelseyhightower/envconfig"
 	"github.com/lestrrat-go/jwx/jwk"
 )
 
 // Config holds the application configuration.
 // We get these from environment variables.
 type Config struct {
-	TeamDomain    string // Your Cloudflare Access team domain
-	AudienceTag   string // The Application Audience (AUD) tag
-	ListenAddress string // The address and port to listen on
+	TeamDomain    string `envconfig:"CF_TEAM_DOMAIN" required:"true"`
+	AudienceTag   string `envconfig:"CF_AUDIENCE_TAG" required:"true"`
+	ListenAddress string `envconfig:"LISTEN_ADDRESS" default:":9001"`
 }
 
 // KeySet holds the fetched JWKs from Cloudflare.
@@ -43,11 +44,11 @@ func newKeySet(teamDomain string) *KeySet {
 func (k *KeySet) fetchKeys(ctx context.Context) (jwk.Set, error) {
 	// Use cache if it's not older than maxAge
 	if time.Since(k.lastFetch) < k.maxAge && k.jwks != nil {
-		log.Println("Using cached JWK set.")
+		slog.Debug("Using cached JWK set.")
 		return k.jwks, nil
 	}
 
-	log.Println("Fetching new JWK set from:", k.fetchURL)
+	slog.Info("Fetching new JWK set from", "url", k.fetchURL)
 	jwks, err := jwk.Fetch(ctx, k.fetchURL)
 	if err != nil {
 		return nil, fmt.Errorf("failed to fetch JWKs: %w", err)
@@ -65,7 +66,7 @@ func (app *application) validationHandler(w http.ResponseWriter, r *http.Request
 	// 1. Extract the token from the CF_Authorization cookie
 	cookie, err := r.Cookie("CF_Authorization")
 	if err != nil {
-		log.Println("Validation failed: Missing CF_Authorization cookie")
+		slog.Warn("Validation failed: Missing CF_Authorization cookie")
 		http.Error(w, "Missing CF_Authorization cookie", http.StatusUnauthorized)
 		return
 	}
@@ -74,12 +75,13 @@ func (app *application) validationHandler(w http.ResponseWriter, r *http.Request
 	// 2. Fetch the JWK set from Cloudflare
 	jwks, err := app.keySet.fetchKeys(r.Context())
 	if err != nil {
-		log.Printf("ERROR: Could not fetch JWKs: %v", err)
+		slog.Error("Could not fetch JWKs", "error", err)
 		http.Error(w, "Failed to fetch validation keys", http.StatusInternalServerError)
 		return
 	}
 
 	// 3. Parse and validate the token
+
 	token, err := jwt.Parse(jwtB64, func(token *jwt.Token) (interface{}, error) {
 		// Find the key that matches the 'kid' in the token header
 		kid, ok := token.Header["kid"].(string)
@@ -102,28 +104,28 @@ func (app *application) validationHandler(w http.ResponseWriter, r *http.Request
 	})
 
 	if err != nil {
-		log.Printf("Validation failed: Invalid token: %v", err)
+		slog.Warn("Validation failed: Invalid token", "error", err)
 		http.Error(w, "Invalid token", http.StatusUnauthorized)
 		return
 	}
 
 	// 4. Check if the token is valid and verify claims
 	if !token.Valid {
-		log.Println("Validation failed: Token is not valid")
+		slog.Warn("Validation failed: Token is not valid")
 		http.Error(w, "Token is not valid", http.StatusUnauthorized)
 		return
 	}
 
 	claims, ok := token.Claims.(jwt.MapClaims)
 	if !ok {
-		log.Println("Validation failed: Could not parse token claims")
-		http.Error(w, "Could not parse token claims", http.StatusUnauthorized)
+		slog.Warn("Validation failed: Could not parse token claims")
+		http.Error(w, "Could not parse token claims", http.StatusInternalServerError)
 		return
 	}
 
 	// Verify 'aud' (Audience) claim
 	if !claims.VerifyAudience(app.config.AudienceTag, true) {
-		log.Printf("Validation failed: Invalid 'aud' claim. Expected '%s', got '%v'", app.config.AudienceTag, claims["aud"])
+		slog.Warn("Validation failed: Invalid 'aud' claim", "expected", app.config.AudienceTag, "got", claims["aud"])
 		http.Error(w, "Invalid audience", http.StatusUnauthorized)
 		return
 	}
@@ -131,7 +133,7 @@ func (app *application) validationHandler(w http.ResponseWriter, r *http.Request
 	// Verify 'iss' (Issuer) claim
 	expectedIssuer := fmt.Sprintf("https://%s.cloudflareaccess.com", app.config.TeamDomain)
 	if !claims.VerifyIssuer(expectedIssuer, true) {
-		log.Printf("Validation failed: Invalid 'iss' claim. Expected '%s', got '%v'", expectedIssuer, claims["iss"])
+		slog.Warn("Validation failed: Invalid 'iss' claim", "expected", expectedIssuer, "got", claims["iss"])
 		http.Error(w, "Invalid issuer", http.StatusUnauthorized)
 		return
 	}
@@ -144,7 +146,7 @@ func (app *application) validationHandler(w http.ResponseWriter, r *http.Request
 	// auth_request_set $x_authentication_id $sent_http_x_authentication_id;
 	// proxy_set_header X-WEBAUTH-USER $x_authentication_id;
 	// proxy_pass         http://grafana;
-	log.Println("Validation successful for user:", claims["email"])
+	slog.Info("Validation successful for user", "email", claims["email"])
 	cfEmail := fmt.Sprintf("%v", claims["email"])
 	w.Header().Add("x-authentication-id", cfEmail)
 	w.WriteHeader(http.StatusOK)
@@ -157,37 +159,38 @@ type application struct {
 }
 
 func main() {
-	// Load configuration from environment variables
-	cfg := &Config{
-		TeamDomain:    os.Getenv("CF_TEAM_DOMAIN"),
-		AudienceTag:   os.Getenv("CF_AUDIENCE_TAG"),
-		ListenAddress: ":9001",
-	}
+	logger := slog.New(slog.NewTextHandler(os.Stdout, nil))
+	slog.SetDefault(logger)
 
-	if cfg.TeamDomain == "" || cfg.AudienceTag == "" {
-		log.Fatal("FATAL: Environment variables CF_TEAM_DOMAIN and CF_AUDIENCE_TAG must be set.")
+	// Load configuration from environment variables
+	var cfg Config
+	err := envconfig.Process("", &cfg)
+	if err != nil {
+		slog.Error("FATAL: Could not process configuration", "error", err)
+		os.Exit(1)
 	}
 
 	app := &application{
-		config: cfg,
+		config: &cfg,
 		keySet: newKeySet(cfg.TeamDomain),
 	}
 
 	// Pre-fetch keys on startup to ensure they are available.
 	if _, err := app.keySet.fetchKeys(context.Background()); err != nil {
-		log.Printf("WARNING: Could not pre-fetch JWKs on startup: %v", err)
+		slog.Warn("Could not pre-fetch JWKs on startup", "error", err)
 	}
 
 	// Define the HTTP server
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", app.validationHandler) // NGINX will send all subrequests here
 
-	log.Printf("Starting JWT validation service on %s", cfg.ListenAddress)
-	log.Printf("Configured for Team Domain: %s", cfg.TeamDomain)
-	log.Printf("Configured for Audience Tag: %s", cfg.AudienceTag)
+	slog.Info("Starting JWT validation service", "address", cfg.ListenAddress)
+	slog.Info("Configured for Team Domain", "domain", cfg.TeamDomain)
+	slog.Info("Configured for Audience Tag", "tag", cfg.AudienceTag)
 
 	// Start the server
 	if err := http.ListenAndServe(cfg.ListenAddress, mux); err != nil {
-		log.Fatalf("FATAL: Could not start server: %s\n", err)
+		slog.Error("FATAL: Could not start server", "error", err)
+		os.Exit(1)
 	}
 }
