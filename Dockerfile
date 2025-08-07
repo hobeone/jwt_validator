@@ -2,7 +2,7 @@
 
 # --- Build Stage ---
 # Use the official Go image as a builder
-FROM golang:1.24.5-bookworm AS builder
+FROM golang:1.24.6-bookworm AS builder
 
 # Set the working directory inside the container
 WORKDIR /app
