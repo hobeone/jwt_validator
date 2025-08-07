@@ -24,8 +24,11 @@ RUN CGO_ENABLED=0 GOOS=linux go build -v -o jwt-validator -ldflags="-w -s" .
 # Use a minimal base image for the final container
 FROM alpine:latest
 
+
 # Set the working directory
-WORKDIR /root/
+WORKDIR /tmp/
+
+RUN adduser -s /bin/nologin -h /tmp -D jwt-validator
 
 # Copy only the compiled binary from the builder stage
 COPY --from=builder /app/jwt-validator .
