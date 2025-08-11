@@ -77,14 +77,14 @@ func TestValidationHandler(t *testing.T) {
 	defer mockJwksServer.Close()
 
 	// 2. Setup: Create the application instance for testing
-	testConfig := &Config{
-		TeamDomain:  "test-team",
-		AudienceTag: "test-aud-tag",
-		ListenAddress: ":9001",
-	}
+    testConfig := &Config{
+        TeamDomain:    "test-team",
+        AudienceTag:   "test-aud-tag",
+        ListenAddress: ":9001",
+    }
 
 	// We override the fetchURL to point to our mock server
-	testKeySet := newKeySet(testConfig.TeamDomain)
+    testKeySet := newKeySet(testConfig.TeamDomain)
 	testKeySet.fetchURL = mockJwksServer.URL
 
 	app := &application{
@@ -98,7 +98,7 @@ func TestValidationHandler(t *testing.T) {
 		buildRequest       func() *http.Request
 		expectedStatusCode int
 	}{
-		{
+        {
 			name: "Valid Token",
 			buildRequest: func() *http.Request {
 				claims := jwt.MapClaims{
@@ -106,10 +106,11 @@ func TestValidationHandler(t *testing.T) {
 					"iss": "https://test-team.cloudflareaccess.com",
 					"exp": time.Now().Add(time.Hour).Unix(),
 					"iat": time.Now().Unix(),
+                    "email": "user@example.com",
 				}
 				token, _ := createTestToken(privateKey, claims)
 				req, _ := http.NewRequest("GET", "/", nil)
-				req.AddCookie(&http.Cookie{Name: "CF_Authorization", Value: token})
+                req.AddCookie(&http.Cookie{Name: "CF_Authorization", Value: token})
 				return req
 			},
 			expectedStatusCode: http.StatusOK,
@@ -122,7 +123,7 @@ func TestValidationHandler(t *testing.T) {
 			},
 			expectedStatusCode: http.StatusUnauthorized,
 		},
-		{
+        {
 			name: "Invalid Signature",
 			buildRequest: func() *http.Request {
 				// Sign with a different key
@@ -130,6 +131,7 @@ func TestValidationHandler(t *testing.T) {
 				claims := jwt.MapClaims{
 					"aud": "test-aud-tag",
 					"iss": "https://test-team.cloudflareaccess.com",
+                    "email": "user@example.com",
 				}
 				token, _ := createTestToken(otherPrivateKey, claims)
 				req, _ := http.NewRequest("GET", "/", nil)
@@ -138,12 +140,13 @@ func TestValidationHandler(t *testing.T) {
 			},
 			expectedStatusCode: http.StatusUnauthorized,
 		},
-		{
+        {
 			name: "Invalid Audience (aud)",
 			buildRequest: func() *http.Request {
 				claims := jwt.MapClaims{
 					"aud": "wrong-aud-tag",
 					"iss": "https://test-team.cloudflareaccess.com",
+                    "email": "user@example.com",
 				}
 				token, _ := createTestToken(privateKey, claims)
 				req, _ := http.NewRequest("GET", "/", nil)
@@ -152,12 +155,13 @@ func TestValidationHandler(t *testing.T) {
 			},
 			expectedStatusCode: http.StatusUnauthorized,
 		},
-		{
+        {
 			name: "Invalid Issuer (iss)",
 			buildRequest: func() *http.Request {
 				claims := jwt.MapClaims{
 					"aud": "test-aud-tag",
 					"iss": "https://wrong-team.cloudflareaccess.com",
+                    "email": "user@example.com",
 				}
 				token, _ := createTestToken(privateKey, claims)
 				req, _ := http.NewRequest("GET", "/", nil)
@@ -166,13 +170,14 @@ func TestValidationHandler(t *testing.T) {
 			},
 			expectedStatusCode: http.StatusUnauthorized,
 		},
-		{
+        {
 			name: "Expired Token",
 			buildRequest: func() *http.Request {
 				claims := jwt.MapClaims{
 					"aud": "test-aud-tag",
 					"iss": "https://test-team.cloudflareaccess.com",
 					"exp": time.Now().Add(-time.Hour).Unix(), // Expired one hour ago
+                    "email": "user@example.com",
 				}
 				token, _ := createTestToken(privateKey, claims)
 				req, _ := http.NewRequest("GET", "/", nil)
@@ -181,6 +186,40 @@ func TestValidationHandler(t *testing.T) {
 			},
 			expectedStatusCode: http.StatusUnauthorized,
 		},
+        {
+            name: "Missing Email Claim",
+            buildRequest: func() *http.Request {
+                claims := jwt.MapClaims{
+                    "aud": "test-aud-tag",
+                    "iss": "https://test-team.cloudflareaccess.com",
+                    "exp": time.Now().Add(time.Hour).Unix(),
+                    "iat": time.Now().Unix(),
+                }
+                token, _ := createTestToken(privateKey, claims)
+                req, _ := http.NewRequest("GET", "/", nil)
+                req.AddCookie(&http.Cookie{Name: "CF_Authorization", Value: token})
+                return req
+            },
+            expectedStatusCode: http.StatusUnauthorized,
+        },
+        {
+            name: "Reject HS256 Token",
+            buildRequest: func() *http.Request {
+                // Build an HS256 token that would otherwise be valid; it should be rejected
+                hsToken := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.MapClaims{
+                    "aud": "test-aud-tag",
+                    "iss": "https://test-team.cloudflareaccess.com",
+                    "exp": time.Now().Add(time.Hour).Unix(),
+                    "email": "user@example.com",
+                })
+                hsToken.Header["kid"] = "test-kid"
+                signed, _ := hsToken.SignedString([]byte("secret"))
+                req, _ := http.NewRequest("GET", "/", nil)
+                req.AddCookie(&http.Cookie{Name: "CF_Authorization", Value: signed})
+                return req
+            },
+            expectedStatusCode: http.StatusUnauthorized,
+        },
 	}
 
 	// 4. Run Tests
@@ -200,9 +239,9 @@ func TestValidationHandler(t *testing.T) {
 
 			req := tc.buildRequest()
 			rr := httptest.NewRecorder()
-			handler := http.HandlerFunc(app.validationHandler)
+            handler := http.HandlerFunc(app.validationHandler)
 
-			handler.ServeHTTP(rr, req)
+            handler.ServeHTTP(rr, req)
 
 			if status := rr.Code; status != tc.expectedStatusCode {
 				t.Errorf("handler returned wrong status code: got %v want %v",

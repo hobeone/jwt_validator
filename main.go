@@ -7,6 +7,8 @@ import (
 	"log/slog"
 	"net/http"
 	"os"
+	"regexp"
+	"sync"
 	"time"
 
 	jwt "github.com/golang-jwt/jwt/v4"
@@ -22,6 +24,19 @@ type Config struct {
 	ListenAddress string `envconfig:"LISTEN_ADDRESS" default:":9001"`
 }
 
+// validate performs basic sanity checks on configuration values.
+func (c *Config) validate() error {
+	// Restrict team domain to alphanumerics and hyphen to avoid SSRF/host injection
+	domainPattern := regexp.MustCompile(`^[A-Za-z0-9-]+$`)
+	if !domainPattern.MatchString(c.TeamDomain) {
+		return fmt.Errorf("invalid CF_TEAM_DOMAIN: %q", c.TeamDomain)
+	}
+	if c.AudienceTag == "" {
+		return fmt.Errorf("CF_AUDIENCE_TAG must not be empty")
+	}
+	return nil
+}
+
 // KeySet holds the fetched JWKs from Cloudflare.
 // It includes a cache mechanism to avoid fetching on every request.
 type KeySet struct {
@@ -29,6 +44,8 @@ type KeySet struct {
 	fetchURL  string
 	lastFetch time.Time
 	maxAge    time.Duration
+	mu        sync.RWMutex
+	client    *http.Client
 }
 
 // newKeySet initializes a KeySet.
@@ -37,26 +54,35 @@ func newKeySet(teamDomain string) *KeySet {
 		fetchURL:  fmt.Sprintf("https://%s.cloudflareaccess.com/cdn-cgi/access/certs", teamDomain),
 		maxAge:    24 * time.Hour, // As per Cloudflare docs, keys rotate every 24h
 		lastFetch: time.Time{},    // Zero time ensures the first fetch happens
+		client: &http.Client{
+			Timeout: 5 * time.Second,
+		},
 	}
 }
 
 // fetchKeys retrieves the public keys from Cloudflare Access and caches them.
 func (k *KeySet) fetchKeys(ctx context.Context) (jwk.Set, error) {
 	// Use cache if it's not older than maxAge
+	k.mu.RLock()
 	if time.Since(k.lastFetch) < k.maxAge && k.jwks != nil {
+		jwks := k.jwks
+		k.mu.RUnlock()
 		slog.Debug("Using cached JWK set.")
-		return k.jwks, nil
+		return jwks, nil
 	}
+	k.mu.RUnlock()
 
 	slog.Info("Fetching new JWK set from", "url", k.fetchURL)
-	jwks, err := jwk.Fetch(ctx, k.fetchURL)
+	jwks, err := jwk.Fetch(ctx, k.fetchURL, jwk.WithHTTPClient(k.client))
 	if err != nil {
 		return nil, fmt.Errorf("failed to fetch JWKs: %w", err)
 	}
 
 	// Update cache
+	k.mu.Lock()
 	k.jwks = jwks
 	k.lastFetch = time.Now()
+	k.mu.Unlock()
 
 	return jwks, nil
 }
@@ -83,6 +109,11 @@ func (app *application) validationHandler(w http.ResponseWriter, r *http.Request
 	// 3. Parse and validate the token
 
 	token, err := jwt.Parse(jwtB64, func(token *jwt.Token) (interface{}, error) {
+		// Enforce strong algorithm to prevent alg confusion attacks
+		if token.Method.Alg() != jwt.SigningMethodRS256.Alg() {
+			return nil, fmt.Errorf("unexpected signing method: %s", token.Header["alg"])
+		}
+
 		// Find the key that matches the 'kid' in the token header
 		kid, ok := token.Header["kid"].(string)
 		if !ok {
@@ -138,6 +169,14 @@ func (app *application) validationHandler(w http.ResponseWriter, r *http.Request
 		return
 	}
 
+	// Require 'email' claim for downstream auth propagation
+	cfEmail, emailOK := claims["email"].(string)
+	if !emailOK || cfEmail == "" {
+		slog.Warn("Validation failed: Missing 'email' claim")
+		http.Error(w, "Missing required claim", http.StatusUnauthorized)
+		return
+	}
+
 	// 5. If all checks pass, return 200 OK
 	// Include the claim email in the x-authentication-id header of the response
 	// Nginx can grab this with the auth_request_set directive.
@@ -146,8 +185,7 @@ func (app *application) validationHandler(w http.ResponseWriter, r *http.Request
 	// auth_request_set $x_authentication_id $sent_http_x_authentication_id;
 	// proxy_set_header X-WEBAUTH-USER $x_authentication_id;
 	// proxy_pass         http://grafana;
-	slog.Info("Validation successful for user", "email", claims["email"])
-	cfEmail := fmt.Sprintf("%v", claims["email"])
+	slog.Info("Validation successful", "email", cfEmail)
 	w.Header().Add("x-authentication-id", cfEmail)
 	w.WriteHeader(http.StatusOK)
 }
@@ -170,6 +208,11 @@ func main() {
 		os.Exit(1)
 	}
 
+	if err := cfg.validate(); err != nil {
+		slog.Error("FATAL: Invalid configuration", "error", err)
+		os.Exit(1)
+	}
+
 	app := &application{
 		config: &cfg,
 		keySet: newKeySet(cfg.TeamDomain),
@@ -182,14 +225,22 @@ func main() {
 
 	// Define the HTTP server
 	mux := http.NewServeMux()
-	mux.HandleFunc("/", app.validationHandler) // NGINX will send all subrequests here
+	mux.HandleFunc("/validate", app.validationHandler)
 
 	slog.Info("Starting JWT validation service", "address", cfg.ListenAddress)
 	slog.Info("Configured for Team Domain", "domain", cfg.TeamDomain)
 	slog.Info("Configured for Audience Tag", "tag", cfg.AudienceTag)
 
-	// Start the server
-	if err := http.ListenAndServe(cfg.ListenAddress, mux); err != nil {
+	// Start the server with timeouts to mitigate slowloris and resource exhaustion
+	server := &http.Server{
+		Addr:              cfg.ListenAddress,
+		Handler:           mux,
+		ReadTimeout:       5 * time.Second,
+		ReadHeaderTimeout: 5 * time.Second,
+		WriteTimeout:      10 * time.Second,
+		IdleTimeout:       60 * time.Second,
+	}
+	if err := server.ListenAndServe(); err != nil {
 		slog.Error("FATAL: Could not start server", "error", err)
 		os.Exit(1)
 	}
