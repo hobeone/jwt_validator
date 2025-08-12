@@ -8,12 +8,13 @@ import (
 	"net/http"
 	"os"
 	"regexp"
+	"runtime"
 	"sync"
 	"time"
 
-	jwt "github.com/golang-jwt/jwt/v4"
 	"github.com/kelseyhightower/envconfig"
-	"github.com/lestrrat-go/jwx/jwk"
+	"github.com/lestrrat-go/jwx/v3/jwk"
+	"github.com/lestrrat-go/jwx/v3/jwt"
 )
 
 // Config holds the application configuration.
@@ -107,73 +108,36 @@ func (app *application) validationHandler(w http.ResponseWriter, r *http.Request
 	}
 
 	// 3. Parse and validate the token
-
-	token, err := jwt.Parse(jwtB64, func(token *jwt.Token) (interface{}, error) {
-		// Enforce strong algorithm to prevent alg confusion attacks
-		if token.Method.Alg() != jwt.SigningMethodRS256.Alg() {
-			return nil, fmt.Errorf("unexpected signing method: %s", token.Header["alg"])
-		}
-
-		// Find the key that matches the 'kid' in the token header
-		kid, ok := token.Header["kid"].(string)
-		if !ok {
-			return nil, fmt.Errorf("expected 'kid' header field")
-		}
-
-		key, found := jwks.LookupKeyID(kid)
-		if !found {
-			return nil, fmt.Errorf("unable to find key with kid '%s'", kid)
-		}
-
-		// Get the raw public key to be used for validation
-		var pubKey interface{}
-		if err := key.Raw(&pubKey); err != nil {
-			return nil, fmt.Errorf("failed to get raw public key: %w", err)
-		}
-
-		return pubKey, nil
-	})
-
+	token, err := jwt.Parse([]byte(jwtB64), jwt.WithKeySet(jwks))
 	if err != nil {
 		slog.Warn("Validation failed: Invalid token", "error", err)
 		http.Error(w, "Invalid token", http.StatusUnauthorized)
 		return
 	}
 
-	// 4. Check if the token is valid and verify claims
-	if !token.Valid {
-		slog.Warn("Validation failed: Token is not valid")
-		http.Error(w, "Token is not valid", http.StatusUnauthorized)
-		return
-	}
-
-	claims, ok := token.Claims.(jwt.MapClaims)
-	if !ok {
-		slog.Warn("Validation failed: Could not parse token claims")
-		http.Error(w, "Could not parse token claims", http.StatusInternalServerError)
-		return
-	}
-
-	// Verify 'aud' (Audience) claim
-	if !claims.VerifyAudience(app.config.AudienceTag, true) {
-		slog.Warn("Validation failed: Invalid 'aud' claim", "expected", app.config.AudienceTag, "got", claims["aud"])
-		http.Error(w, "Invalid audience", http.StatusUnauthorized)
-		return
-	}
-
-	// Verify 'iss' (Issuer) claim
+	// 4. Verify claims
 	expectedIssuer := fmt.Sprintf("https://%s.cloudflareaccess.com", app.config.TeamDomain)
-	if !claims.VerifyIssuer(expectedIssuer, true) {
-		slog.Warn("Validation failed: Invalid 'iss' claim", "expected", expectedIssuer, "got", claims["iss"])
-		http.Error(w, "Invalid issuer", http.StatusUnauthorized)
+	err = jwt.Validate(token,
+		jwt.WithIssuer(expectedIssuer),
+		jwt.WithAudience(app.config.AudienceTag),
+	)
+	if err != nil {
+		slog.Warn("Validation failed: Invalid claims", "error", err)
+		http.Error(w, "Invalid claims", http.StatusUnauthorized)
 		return
 	}
 
 	// Require 'email' claim for downstream auth propagation
-	cfEmail, emailOK := claims["email"].(string)
-	if !emailOK || cfEmail == "" {
+	var cfEmail string
+	err = token.Get("email", &cfEmail)
+	if err != nil {
 		slog.Warn("Validation failed: Missing 'email' claim")
 		http.Error(w, "Missing required claim", http.StatusUnauthorized)
+		return
+	}
+	if cfEmail == "" {
+		slog.Warn("Validation failed: 'email' claim is an empty string")
+		http.Error(w, "Invalid email claim", http.StatusUnauthorized)
 		return
 	}
 
@@ -227,6 +191,7 @@ func main() {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/validate", app.validationHandler)
 
+	slog.Info("Built with GO", "version", runtime.Version())
 	slog.Info("Starting JWT validation service", "address", cfg.ListenAddress)
 	slog.Info("Configured for Team Domain", "domain", cfg.TeamDomain)
 	slog.Info("Configured for Audience Tag", "tag", cfg.AudienceTag)
