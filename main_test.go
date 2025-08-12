@@ -103,6 +103,7 @@ func TestValidationHandler(t *testing.T) {
 		name               string
 		buildRequest       func() *http.Request
 		expectedStatusCode int
+		jwksShouldFail     bool
 	}{
 		{
 			name: "Valid Token",
@@ -124,13 +125,132 @@ func TestValidationHandler(t *testing.T) {
 			},
 			expectedStatusCode: http.StatusOK,
 		},
+		{
+			name: "No Cookie",
+			buildRequest: func() *http.Request {
+				req, _ := http.NewRequest("GET", "/", nil)
+				return req
+			},
+			expectedStatusCode: http.StatusUnauthorized,
+		},
+		{
+			name: "Malformed Token",
+			buildRequest: func() *http.Request {
+				req, _ := http.NewRequest("GET", "/", nil)
+				req.AddCookie(&http.Cookie{Name: "CF_Authorization", Value: "not-a-jwt"})
+				return req
+			},
+			expectedStatusCode: http.StatusUnauthorized,
+		},
+		{
+			name: "Wrong Issuer",
+			buildRequest: func() *http.Request {
+				tok, _ := jwt.NewBuilder().
+					Audience([]string{"test-aud-tag"}).
+					Issuer("https://wrong-team.cloudflareaccess.com").
+					Expiration(time.Now().Add(time.Hour)).
+					IssuedAt(time.Now()).
+					Claim("email", "user@example.com").
+					Build()
+				token, _ := createTestToken(privateKey, tok)
+				req, _ := http.NewRequest("GET", "/", nil)
+				req.AddCookie(&http.Cookie{Name: "CF_Authorization", Value: token})
+				return req
+			},
+			expectedStatusCode: http.StatusUnauthorized,
+		},
+		{
+			name: "Wrong Audience",
+			buildRequest: func() *http.Request {
+				tok, _ := jwt.NewBuilder().
+					Audience([]string{"wrong-aud-tag"}).
+					Issuer("https://test-team.cloudflareaccess.com").
+					Expiration(time.Now().Add(time.Hour)).
+					IssuedAt(time.Now()).
+					Claim("email", "user@example.com").
+					Build()
+				token, _ := createTestToken(privateKey, tok)
+				req, _ := http.NewRequest("GET", "/", nil)
+				req.AddCookie(&http.Cookie{Name: "CF_Authorization", Value: token})
+				return req
+			},
+			expectedStatusCode: http.StatusUnauthorized,
+		},
+		{
+			name: "Expired Token",
+			buildRequest: func() *http.Request {
+				tok, _ := jwt.NewBuilder().
+					Audience([]string{"test-aud-tag"}).
+					Issuer("https://test-team.cloudflareaccess.com").
+					Expiration(time.Now().Add(-time.Hour)).
+					IssuedAt(time.Now().Add(-2 * time.Hour)).
+					Claim("email", "user@example.com").
+					Build()
+				token, _ := createTestToken(privateKey, tok)
+				req, _ := http.NewRequest("GET", "/", nil)
+				req.AddCookie(&http.Cookie{Name: "CF_Authorization", Value: token})
+				return req
+			},
+			expectedStatusCode: http.StatusUnauthorized,
+		},
+		{
+			name: "No Email Claim",
+			buildRequest: func() *http.Request {
+				tok, _ := jwt.NewBuilder().
+					Audience([]string{"test-aud-tag"}).
+					Issuer("https://test-team.cloudflareaccess.com").
+					Expiration(time.Now().Add(time.Hour)).
+					IssuedAt(time.Now()).
+					Build()
+				token, _ := createTestToken(privateKey, tok)
+				req, _ := http.NewRequest("GET", "/", nil)
+				req.AddCookie(&http.Cookie{Name: "CF_Authorization", Value: token})
+				return req
+			},
+			expectedStatusCode: http.StatusUnauthorized,
+		},
+		{
+			name: "Empty Email Claim",
+			buildRequest: func() *http.Request {
+				tok, _ := jwt.NewBuilder().
+					Audience([]string{"test-aud-tag"}).
+					Issuer("https://test-team.cloudflareaccess.com").
+					Expiration(time.Now().Add(time.Hour)).
+					IssuedAt(time.Now()).
+					Claim("email", "").
+					Build()
+				token, _ := createTestToken(privateKey, tok)
+				req, _ := http.NewRequest("GET", "/", nil)
+				req.AddCookie(&http.Cookie{Name: "CF_Authorization", Value: token})
+				return req
+			},
+			expectedStatusCode: http.StatusUnauthorized,
+		},
+		{
+			name: "JWKS Endpoint Down",
+			buildRequest: func() *http.Request {
+				tok, _ := jwt.NewBuilder().
+					Audience([]string{"test-aud-tag"}).
+					Issuer("https://test-team.cloudflareaccess.com").
+					Expiration(time.Now().Add(time.Hour)).
+					IssuedAt(time.Now()).
+					Claim("email", "user@example.com").
+					Build()
+				token, _ := createTestToken(privateKey, tok)
+				req, _ := http.NewRequest("GET", "/", nil)
+				req.AddCookie(&http.Cookie{Name: "CF_Authorization", Value: token})
+				return req
+			},
+			expectedStatusCode: http.StatusInternalServerError,
+			jwksShouldFail:     true,
+		},
 	}
 
 	// 4. Run Tests
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
 			// In case a test closes the server, we need to reset it for the next one
-			if mockJwksServer.URL == "" {
+			if mockJwksServer.URL == "" || !tc.jwksShouldFail {
 				mockJwksServer = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 					keySet := jwk.NewSet()
 					if err := keySet.AddKey(publicKey); err != nil {
@@ -139,6 +259,12 @@ func TestValidationHandler(t *testing.T) {
 					json.NewEncoder(w).Encode(keySet)
 				}))
 				app.keySet.fetchURL = mockJwksServer.URL
+				// Clear the cache to force a re-fetch
+				app.keySet.lastFetch = time.Time{}
+			}
+
+			if tc.jwksShouldFail {
+				mockJwksServer.Close()
 				// Clear the cache to force a re-fetch
 				app.keySet.lastFetch = time.Time{}
 			}
@@ -237,5 +363,58 @@ func TestFetchKeysCache(t *testing.T) {
 	}
 	if testKeySet.lastFetch.Equal(firstFetchTime) {
 		t.Errorf("Expected lastFetch time to be updated, but it was unchanged")
+	}
+}
+
+func TestConfigValidation(t *testing.T) {
+	testCases := []struct {
+		name        string
+		config      Config
+		expectError bool
+	}{
+		{
+			name: "Valid Config",
+			config: Config{
+				TeamDomain:  "my-team-is-great",
+				AudienceTag: "my-aud-tag",
+			},
+			expectError: false,
+		},
+		{
+			name: "Invalid TeamDomain (contains invalid characters)",
+			config: Config{
+				TeamDomain:  "my_team_is_great",
+				AudienceTag: "my-aud-tag",
+			},
+			expectError: true,
+		},
+		{
+			name: "Invalid TeamDomain (is a URL)",
+			config: Config{
+				TeamDomain:  "https://google.com",
+				AudienceTag: "my-aud-tag",
+			},
+			expectError: true,
+		},
+		{
+			name: "Empty AudienceTag",
+			config: Config{
+				TeamDomain:  "my-team",
+				AudienceTag: "",
+			},
+			expectError: true,
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			err := tc.config.validate()
+			if tc.expectError && err == nil {
+				t.Errorf("Expected an error, but got none")
+			}
+			if !tc.expectError && err != nil {
+				t.Errorf("Did not expect an error, but got: %v", err)
+			}
+		})
 	}
 }
